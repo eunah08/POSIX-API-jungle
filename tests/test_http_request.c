@@ -18,12 +18,6 @@ static void test_request_line_ok(void) {
     CHECK_STR(req.version, "HTTP/1.1");
     CHECK(req.keep_alive == 1);
 
-    // 절대 URI (Forward Proxy): path/query는 호스트 뒤 기준
-    memset(&req, 0, sizeof(req));
-    CHECK(parse_request_line("GET http://localhost:8001/a.html?x=1 HTTP/1.1\r\n", &req) == 0);
-    CHECK_STR(req.uri, "http://localhost:8001/a.html?x=1");
-    CHECK_STR(req.path, "/a.html");
-    CHECK_STR(req.query, "x=1");
 }
 
 // 정상: POST, HTTP/1.0 (keep_alive 기본 0)
@@ -87,6 +81,13 @@ static void test_header_connection(void) {
     CHECK(req.keep_alive == 0);
     CHECK(parse_header_line("Connection: Keep-Alive\r\n", &req) == 0);
     CHECK(req.keep_alive == 1);
+
+    // 절대 URI (Forward Proxy): path/query는 호스트 뒤 기준
+    memset(&req, 0, sizeof(req));
+    CHECK(parse_request_line("GET http://localhost:8001/a.html?x=1 HTTP/1.1\r\n", &req) == 0);
+    CHECK_STR(req.uri, "http://localhost:8001/a.html?x=1");
+    CHECK_STR(req.path, "/a.html");
+    CHECK_STR(req.query, "x=1");
 }
 
 // 오류: ':' 없음 → 400, 헤더 MAX_HEADERS 초과 → 431

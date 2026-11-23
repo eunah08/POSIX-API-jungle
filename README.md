@@ -85,7 +85,7 @@ curl -x 127.0.0.1:8080 http://127.0.0.1:8001/index.html           # Forward
 
 ## 구현 메모
 
-- **CGI:** 자식의 stdout을 소켓이 아닌 pipe로 받아 클라이언트에 중계합니다. exec 실패는 500, 출력이 10초 넘게 없으면 504를 보내기 위해서입니다. POST 본문은 임시 파일을 stdin으로 연결합니다. 응답은 `Connection: close`로 끝납니다.
+- **CGI:** 상태 라인을 먼저 보낸 뒤 `fork`한 자식이 `dup2`로 stdout을 클라이언트 소켓에 연결하고 `execve`합니다(CSAPP Tiny와 같은 방식). POST 본문은 임시 파일을 stdin으로 연결합니다. 10초 안에 끝나지 않으면 강제 종료하고 연결을 닫습니다. 상태 라인을 이미 보낸 뒤라서 이때는 504 대신 연결을 닫습니다.
 - **Reverse Proxy:** 백엔드에 연결이 안 되면 다음 백엔드로 넘어가고, 전부 실패하면 502. 연결 후 5초 안에 응답이 없으면 504.
 - **Forward Proxy:** `-f`로 켰을 때만 동작하고 꺼져 있으면 403. 프록시를 거친 응답은 모두 `Connection: close`입니다.
 - **정적 파일:** `realpath`로 root 밖 접근을 403으로 막습니다. URL 퍼센트 디코딩은 하지 않습니다(`%2e%2e`는 404).
@@ -99,7 +99,7 @@ curl -x 127.0.0.1:8080 http://127.0.0.1:8001/index.html           # Forward
 ## 테스트
 
 ```bash
-make test                 # 단위 테스트 (파서 · 라우터 · 절대 URI · MIME)
+make test                 # 단위 테스트 (파서 · 라우터 · 절대 URI · MIME · 응답 · rio · 스레드 풀 · 정적 파일 · CGI)
 make asan                 # AddressSanitizer + UBSan으로 위 테스트 반복
 make && tests/functional.sh   # 서버 4개를 띄워 정적 · 오류 · keep-alive · CGI · Reverse · Forward · 502/504 확인
 tests/load.sh             # 서버 실행 후 부하 측정 (wrk > ab > curl)

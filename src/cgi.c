@@ -2,15 +2,15 @@
 //
 // CGI란: 요청이 올 때마다 별도의 프로그램(cgi-bin/adder 등)을 실행하고, 그 프로그램이 출력한 내용을 응답으로 보내는 방식
 //
-// 전체 흐름
+// 전체 흐름 (CSAPP 11.6 Tiny와 같은 방식)
 //   1. 실행할 프로그램 파일을 찾는다 (없으면 404, 실행 못 하면 403)
-//   2. fork로 자식 프로세스를 만들고, 자식이 execve로 그 프로그램이 된다
-//   3. 프로그램이 출력한 내용은 pipe(관)로 받아서 클라이언트에게 전달한다
-//      (소켓에 바로 연결하지 않는 이유: 실행 실패나 무응답일 때 500/504 오류 응답을 보내기 위해)
+//   2. 상태 라인("HTTP/1.1 200 OK")을 먼저 보낸다. 나머지 헤더와 본문은 CGI 프로그램이 직접 출력한다
+//   3. fork로 자식 프로세스를 만든다. 자식은 dup2로 stdout을 클라이언트 소켓에 연결한 뒤 execve로 CGI 프로그램이 된다
+//      → 프로그램이 printf로 출력하면 그 내용이 그대로 클라이언트에게 간다
+//   4. 부모는 자식이 끝날 때까지 기다린다 (waitpid). 너무 오래 걸리면 강제 종료한다
 #include "cgi.h"
 #include <errno.h>
 #include <fcntl.h>
-#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,8 +20,9 @@
 #include <unistd.h>
 #include "rio.h"
 
-#define CGI_TIMEOUT_SEC 10                                      // CGI가 이 시간 동안 아무 출력이 없으면 504
+#define CGI_TIMEOUT_SEC 10                                           // CGI가 이 시간 안에 끝나지 않으면 강제 종료
 #define CGI_STATUS_LINE "HTTP/1.1 200 OK\r\nConnection: close\r\n"   // 나머지 헤더는 CGI 프로그램이 직접 출력한다
+#define EXEC_FAILED_CODE 127                                         // 자식이 execve에 실패했을 때의 종료 코드
 
 // CGI 프로그램에게 전달할 환경변수 모음 (요청 정보를 이 방법으로 알려 준다)
 typedef struct {
@@ -53,16 +54,6 @@ static void fill_env(cgi_env *env, const http_request *req) {
     env->list[4] = env->type;
     env->list[5] = "GATEWAY_INTERFACE=CGI/1.1";
     env->list[6] = NULL;
-}
-
-// pipe를 만든다. exec할 때 자동으로 닫히게 표시해 두어서, 다른 CGI 자식이 이 pipe를 몰래 물려받지 않게 한다
-static int make_pipe(int fds[2]) {
-    if (pipe(fds) < 0) {
-        return -1;
-    }
-    fcntl(fds[0], F_SETFD, FD_CLOEXEC);
-    fcntl(fds[1], F_SETFD, FD_CLOEXEC);
-    return 0;
 }
 
 // CGI 프로그램이 입력(stdin)으로 읽을 fd를 만든다
@@ -125,80 +116,32 @@ static int find_program(char *program, size_t size, const char *cgi_dir, const c
     return 0;
 }
 
-// 자식이 프로그램 실행에 성공했는지 확인한다
-//   성공하면 error_fd가 exec와 함께 닫혀서 read가 0을 돌려준다
-//   실패하면 자식이 오류 번호를 적어 두고 종료하므로 read가 양수를 돌려준다
-// 실행에 성공했으면 1, 실패했으면 0
-static int child_started_ok(int error_fd) {
-    int error_number;
-    ssize_t count = read(error_fd, &error_number, sizeof(error_number));
-
-    while (count < 0 && errno == EINTR) {
-        count = read(error_fd, &error_number, sizeof(error_number));
-    }
-
-    if (count > 0) {
-        return 0;
-    }
-    return 1;
-}
-
-// 문제가 생겼을 때 돌려줄 값을 정한다
-//   이미 응답을 보내기 시작했다면 오류 응답을 줄 수 없으니 -1(연결 닫기), 아직이면 오류 코드
-static int error_code(int already_sent, int code) {
-    if (already_sent) {
-        return -1;
-    }
-    return code;
-}
-
-// CGI의 출력을 읽어서 클라이언트(fd)에게 전달한다. 첫 출력이 나올 때 상태 라인을 먼저 보낸다
-// 성공 0, 아직 아무것도 못 보냈을 때의 문제는 500/504, 전달 도중 문제는 -1
-static int relay_output(int fd, int output_fd) {
-    char buffer[8192];
-    int already_sent = 0;           // 클라이언트에게 뭔가 보냈는지
+// 자식 프로세스가 끝날 때까지 기다린다 (최대 CGI_TIMEOUT_SEC초)
+// 정상 종료면 0, 실행 실패나 시간 초과면 -1
+static int wait_for_child(pid_t pid) {
+    int waited_ms = 0;
 
     while (1) {
-        // 출력이 올 때까지 최대 CGI_TIMEOUT_SEC초 기다린다
-        struct pollfd waiting;
-        waiting.fd = output_fd;
-        waiting.events = POLLIN;
-        waiting.revents = 0;
-        int ready = poll(&waiting, 1, CGI_TIMEOUT_SEC * 1000);
+        int status;
+        pid_t finished = waitpid(pid, &status, WNOHANG);       // WNOHANG: 안 끝났으면 기다리지 않고 바로 돌아옴
 
-        if (ready < 0) {
-            if (errno == EINTR) {
-                continue;
+        if (finished == pid) {
+            if (WIFEXITED(status) && WEXITSTATUS(status) == EXEC_FAILED_CODE) {
+                return -1;          // execve에 실패해서 끝난 것
             }
-            return error_code(already_sent, 500);
+            return 0;
         }
-        if (ready == 0) {           // 시간 초과
-            return error_code(already_sent, 504);
+        if (finished < 0 && errno != EINTR) {
+            return -1;
         }
 
-        ssize_t count = read(output_fd, buffer, sizeof(buffer));
-        if (count < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return error_code(already_sent, 500);
+        if (waited_ms >= CGI_TIMEOUT_SEC * 1000) {              // 너무 오래 걸림: 강제 종료하고 회수
+            kill(pid, SIGKILL);
+            waitpid(pid, NULL, 0);
+            return -1;
         }
-        if (count == 0) {           // CGI가 출력을 끝냈다
-            if (already_sent) {
-                return 0;
-            }
-            return 500;             // 아무 출력도 없었다면 오류
-        }
-
-        if (!already_sent) {
-            if (rio_writen(fd, CGI_STATUS_LINE, strlen(CGI_STATUS_LINE)) < 0) {
-                return -1;
-            }
-            already_sent = 1;
-        }
-        if (rio_writen(fd, buffer, count) < 0) {
-            return -1;              // 클라이언트가 연결을 끊음
-        }
+        usleep(2000);                                           // 2ms 쉬었다가 다시 확인
+        waited_ms = waited_ms + 2;
     }
 }
 
@@ -210,7 +153,7 @@ int serve_cgi(int fd, const char *cgi_dir, const http_request *req) {
         return error;
     }
 
-    // 2. 자식에게 줄 환경변수와 입력, 출력용 pipe 준비 (fork 전에 모두 만들어 둔다)
+    // 2. 자식에게 줄 환경변수와 입력(stdin) 준비 (fork 전에 모두 만들어 둔다)
     cgi_env env;
     fill_env(&env, req);
 
@@ -218,68 +161,36 @@ int serve_cgi(int fd, const char *cgi_dir, const http_request *req) {
     if (input_fd < 0) {
         return 500;
     }
-    int output_pipe[2];             // [0] = 읽는 쪽(부모), [1] = 쓰는 쪽(자식)
-    int error_pipe[2];              // 자식이 실행에 실패했을 때 알려 주는 용도
-    if (make_pipe(output_pipe) < 0) {
+
+    // 3. 상태 라인을 먼저 보낸다. 나머지 헤더와 본문은 CGI 프로그램이 출력한다
+    if (rio_writen(fd, CGI_STATUS_LINE, strlen(CGI_STATUS_LINE)) < 0) {
         close(input_fd);
-        return 500;
-    }
-    if (make_pipe(error_pipe) < 0) {
-        close(input_fd);
-        close(output_pipe[0]);
-        close(output_pipe[1]);
-        return 500;
+        return -1;
     }
 
-    // 3. fork: 이 줄 이후 부모와 자식이 각각 아래 코드를 실행한다
+    // 4. fork: 이 줄 이후 부모와 자식이 각각 아래 코드를 실행한다
     pid_t pid = fork();
     if (pid < 0) {
         close(input_fd);
-        close(output_pipe[0]);
-        close(output_pipe[1]);
-        close(error_pipe[0]);
-        close(error_pipe[1]);
-        return 500;
+        return -1;                  // 상태 라인을 이미 보냈으니 오류 응답은 못 보내고 연결을 닫는다
     }
 
     // ── 자식 프로세스: 입출력을 연결하고 CGI 프로그램으로 변신(execve) ──
     if (pid == 0) {
-        dup2(input_fd, STDIN_FILENO);           // 프로그램의 입력(stdin)을 본문으로
-        dup2(output_pipe[1], STDOUT_FILENO);    // 프로그램의 출력(stdout)을 pipe로
+        dup2(input_fd, STDIN_FILENO);       // 프로그램의 입력(stdin)을 본문으로
+        dup2(fd, STDOUT_FILENO);            // 프로그램의 출력(stdout)을 클라이언트 소켓으로
 
         char *arguments[2];
         arguments[0] = program;
         arguments[1] = NULL;
         execve(program, arguments, env.list);
 
-        // 여기까지 왔다면 execve가 실패한 것이다: 오류 번호를 부모에게 알리고 종료
-        int error_number = errno;
-        ssize_t written = write(error_pipe[1], &error_number, sizeof(error_number));
-        (void)written;
-        _exit(127);
+        _exit(EXEC_FAILED_CODE);            // 여기까지 왔다면 execve가 실패한 것이다
     }
 
     // ── 부모 프로세스 ──
-    close(input_fd);                // 자식이 쓰는 쪽은 부모가 쓸 일이 없으니 닫는다
-    close(output_pipe[1]);
-    close(error_pipe[1]);
+    close(input_fd);                        // 입력 fd는 자식이 가져갔으니 부모는 닫는다
 
-    int started = child_started_ok(error_pipe[0]);
-    close(error_pipe[0]);
-    if (!started) {
-        close(output_pipe[0]);
-        waitpid(pid, NULL, 0);
-        return 500;
-    }
-
-    // 4. CGI 출력을 클라이언트에게 전달
-    int result = relay_output(fd, output_pipe[0]);
-    close(output_pipe[0]);
-
-    // 5. 정리: 문제가 있었다면 자식을 강제 종료하고, 항상 waitpid로 자식을 회수한다 (안 하면 좀비 프로세스가 남는다)
-    if (result != 0) {
-        kill(pid, SIGKILL);
-    }
-    waitpid(pid, NULL, 0);
-    return result;
+    // 5. 자식이 끝날 때까지 기다리고 회수한다 (회수하지 않으면 좀비 프로세스가 남는다)
+    return wait_for_child(pid);
 }

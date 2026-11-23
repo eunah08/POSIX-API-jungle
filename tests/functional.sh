@@ -118,6 +118,9 @@ check_contains "backend-2 응답" "backend-2" "$R"
 FIRST=$(curl -s "http://127.0.0.1:$PORT/api/"); SECOND=$(curl -s "http://127.0.0.1:$PORT/api/")
 check "연속 요청은 서로 다른 백엔드" "yes" "$([ "$FIRST" != "$SECOND" ] && echo yes || echo no)"
 
+check "백엔드 404도 그대로 전달" 404 "$(status "http://127.0.0.1:$PORT/api/none.html")"
+check "POST도 백엔드로 전달 (백엔드가 405로 답함)" 405 "$(status -X POST -d x=1 "http://127.0.0.1:$PORT/api/")"
+
 echo "== Forward Proxy"
 check_contains "-f 켠 서버: 절대 URI 중계" "backend-1" "$(curl -s --noproxy "" -x "127.0.0.1:$PORT" "http://127.0.0.1:$B1/api/")"
 check "원 서버 404 그대로 전달" 404 "$(status --noproxy "" -x "127.0.0.1:$PORT" "http://127.0.0.1:$B1/none.html")"
